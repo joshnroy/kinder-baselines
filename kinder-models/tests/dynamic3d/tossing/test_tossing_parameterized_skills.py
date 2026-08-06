@@ -26,6 +26,7 @@ from kinder_models.dynamic3d.tossing.parameterized_skills import (
     create_lifted_controllers,
     get_target_robot_pose_from_parameters,
 )
+from kinder_models.dynamic3d.utils import PyBulletSim
 
 kinder.register_all_environments()
 
@@ -326,6 +327,43 @@ def test_repeated_grounding_does_not_leak_pybullet_clients():
     )
 
     env.close()
+
+
+def test_sim_releases_its_client_when_it_goes_out_of_scope():
+    """Test that a PyBulletSim releases its client with no del and no close().
+
+    The test above calls del and gc.collect() to make its measurement deterministic,
+    which leaves open whether a caller has to do the same. It does not: the only
+    reference to the sim dies with the frame that holds it, and reference counting
+    releases it there, so an ordinary function return is enough.
+    """
+
+    state = _create_robot_state(
+        arm_joints=[0.0] * 7,
+        gripper=0.0,
+        base_x=0.0,
+        base_y=0.0,
+        base_theta=0.0,
+    )
+
+    def build_and_drop_sim() -> int:
+        """Build a sim and return only its client id, so no reference to it escapes."""
+        sim = PyBulletSim(state)
+        # Check that a client really was opened, so that the assertions below cannot
+        # pass against a sim that never connected.
+        assert p.getConnectionInfo(physicsClientId=sim.physics_client_id)["isConnected"]
+        return sim.physics_client_id
+
+    clients_before = _count_connected_pybullet_clients()
+    client_id = build_and_drop_sim()
+
+    # No del and no gc.collect() here, deliberately: that is the claim under test.
+    assert not p.getConnectionInfo(physicsClientId=client_id)["isConnected"], (
+        f"PyBullet client {client_id} was still connected after the only reference "
+        f"to its PyBulletSim went out of scope"
+    )
+    clients_after = _count_connected_pybullet_clients()
+    assert clients_after == clients_before
 
 
 def test_move_to_target_arm_end_effector():
