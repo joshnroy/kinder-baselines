@@ -821,11 +821,9 @@ class SweepOriController(GroundParameterizedController[ObjectCentricState, Array
         target_base_pose = get_target_robot_pose_from_parameters(
             target_object_pose, target_distance, target_rot
         )
-        # Run motion planning. The wiper is already held by the robot at this
-        # point (picked up by PickWiperOriController), so it moves rigidly
-        # with the robot's own footprint rather than being a real static
-        # obstacle; exclude it or every plan here would spuriously collide
-        # with it.
+        # Run motion planning. At this point the wiper's own geometry sits
+        # within the robot's footprint (it is being carried), so treating it
+        # as a static obstacle would make every plan here collide with it.
         wiper = self.objects[1]
         base_motion_plan = run_base_motion_planning(
             state=x,
