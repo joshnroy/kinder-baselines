@@ -821,7 +821,12 @@ class SweepOriController(GroundParameterizedController[ObjectCentricState, Array
         target_base_pose = get_target_robot_pose_from_parameters(
             target_object_pose, target_distance, target_rot
         )
-        # Run motion planning.
+        # Run motion planning. The wiper is already held by the robot at this
+        # point (picked up by PickWiperOriController), so it moves rigidly
+        # with the robot's own footprint rather than being a real static
+        # obstacle; exclude it or every plan here would spuriously collide
+        # with it.
+        wiper = self.objects[1]
         base_motion_plan = run_base_motion_planning(
             state=x,
             target_base_pose=target_base_pose,
@@ -830,6 +835,7 @@ class SweepOriController(GroundParameterizedController[ObjectCentricState, Array
             seed=0,  # use a constant seed to effectively make this "deterministic"
             extend_xy_magnitude=extend_xy_magnitude,
             extend_rot_magnitude=extend_rot_magnitude,
+            disable_collision_objects=[wiper.name],
         )
         assert base_motion_plan is not None
         self._current_base_motion_plan = base_motion_plan
