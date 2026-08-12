@@ -1375,11 +1375,11 @@ def test_move_to_throw_pose_controller():
     params = draws[0]
 
     # Record what the controller asks the base planner to ignore. Asserting on the
-    # resulting plan would prove nothing: base collision checking is currently
-    # commented out in run_base_motion_planning (dynamic3d/utils.py), so every plan
-    # succeeds whether or not the held object is excluded. What this pins is that the
-    # controller passes the held object down, which is what will matter when that
-    # checking is switched back on.
+    # resulting plan would answer a weaker question than this does: a plan can succeed
+    # for reasons unrelated to the exclusion, whereas the argument the controller
+    # passes down is exactly the thing under test. Base collision checking is live in
+    # run_base_motion_planning (dynamic3d/utils.py), so the exclusion now decides
+    # whether the robot's own held object rejects every plan it makes.
     recorded_disabled: list[list[str] | None] = []
 
     def _recording_run_base_motion_planning(**kwargs):

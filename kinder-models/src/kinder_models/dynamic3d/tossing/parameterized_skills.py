@@ -222,11 +222,14 @@ class MoveToThrowPoseController(MoveToTargetGroundController):
     taken from. And it excludes the held object from base collision checking by
     default, because the robot is carrying that object while it drives, so checking
     the base against it would reject every plan.
-    That exclusion is a no-op today: run_base_motion_planning currently leaves its
-    obstacle set empty (the two lines that would fill it are commented out in
-    dynamic3d/utils.py), so no base plan is collision checked at all. It is here so
-    that the held object is already excluded when that checking is switched back on,
-    which is also why the two pick-and-toss tests pass the same list by hand.
+    That exclusion is load-bearing: run_base_motion_planning does collision check the
+    base against the scene's obstacle geoms, and it drops disable_collision_objects
+    from the obstacle set before looking up each remaining object's geom, so naming
+    the held object there is the only thing that keeps the robot's own cargo out.
+    sweep3D's wipe controller excludes the carried wiper for the same reason. Nothing
+    excludes it automatically for a caller that grounds MoveToTargetGroundController
+    itself rather than this subclass, which is why the pick-and-toss tests pass the
+    list by hand.
     """
 
     def sample_parameters(self, x: ObjectCentricState, rng: np.random.Generator) -> Any:
