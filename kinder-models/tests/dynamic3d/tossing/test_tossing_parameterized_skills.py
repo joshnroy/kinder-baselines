@@ -1736,10 +1736,34 @@ def test_toss_release_speed_scales_every_limit_by_the_same_factor():
     shape, so the release point stays in the same phase and the parameter keeps meaning
     what its name says.
     """
-    scale = 1.7
-    limits = toss_profile_limits(scale * TOSS_MAX_VEL)
-    expected = (scale * TOSS_MAX_VEL, scale * TOSS_MAX_ACCEL, scale * TOSS_MAX_DECEL)
-    assert np.allclose(limits, expected)
+    # The invariant that *is* "scaled together": the profile's shape. If all three move
+    # by one factor then the acceleration-to-velocity and deceleration-to-velocity ratios
+    # are the same at every speed as at the default, and the profile is the default one
+    # replayed on a stretched clock.
+    #
+    # Asserted a few ULP wide rather than bitwise. Bitwise equality here would be a claim
+    # about floating-point associativity, not about this function: recovering a ratio
+    # divides back out a factor that was multiplied in, and a/(b*c)*c need not return the
+    # starting bits. At 1.7x the three recovered ratios differ in the final bit while the
+    # code applies one `effort` to all three.
+    shape = np.array([TOSS_MAX_ACCEL, TOSS_MAX_DECEL]) / TOSS_MAX_VEL
+    for scale in (0.25, 0.5, 1.0, 1.7, 2.0, 3.0):
+        max_vel, max_accel, max_decel = toss_profile_limits(scale * TOSS_MAX_VEL)
+        assert np.allclose([max_accel, max_decel] / max_vel, shape, rtol=1e-15), scale
+        assert max_vel == scale * TOSS_MAX_VEL
+
+    # Linear in the parameter, and proportional through the origin rather than merely
+    # affine -- an offset would make "twice the speed" mean something other than twice
+    # the effort.
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        speed = rng.uniform(0.05, 5.0) * TOSS_MAX_VEL
+        factor = rng.uniform(0.05, 5.0)
+        scaled = np.array(toss_profile_limits(factor * speed))
+        assert np.allclose(
+            scaled, factor * np.array(toss_profile_limits(speed)), rtol=1e-12
+        )
+    assert np.array_equal(np.array(toss_profile_limits(0.0)), np.zeros(3))
 
 
 def test_toss_release_speed_raises_the_speed_the_profile_commands_at_release():
