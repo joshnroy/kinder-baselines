@@ -55,6 +55,37 @@ from kinder_models.dynamic3d.utils import (
 TOSS_WINDUP_ARM_CONF = np.deg2rad([0.0, 50.0, 180.0, -110.0, 0.0, -100.0, 90.0])
 TOSS_RELEASE_ARM_CONF = np.deg2rad([0.0, 20.0, 180.0, -35.0, 0.0, 25.0, 90.0])
 
+# The swing's own speed limits, and deliberately not the arm's: _ARM_MAX_VEL is 70-80
+# deg/s per joint, and a toss over-drives that on purpose -- these are the hand-tuned
+# "throw hard" numbers. They were literals inline in TossController.reset until the
+# release speed became a parameter, and they are now that parameter's default, so a
+# caller that passes nothing gets exactly the motion every earlier result was measured
+# against.
+TOSS_MAX_VEL = np.deg2rad(140.0)
+TOSS_MAX_ACCEL = np.deg2rad(300.0)
+TOSS_MAX_DECEL = np.deg2rad(200.0)
+
+
+def toss_profile_limits(
+    release_speed: float = TOSS_MAX_VEL,
+) -> tuple[float, float, float]:
+    """The (max_vel, max_accel, max_decel) triple a toss at release_speed is timed by.
+
+    release_speed scales all three limits by the same factor rather than max_vel alone,
+    which is what makes it an "effort" and not just a speed cap. The reason is the
+    release rule: TossController opens the gripper at a fixed fraction of the path's
+    *distance*, and _trapezoidal_motion_profile turns triangular once
+    0.5*v^2/a + 0.5*v^2/d exceeds that distance. Raise max_vel on its own and the profile
+    crosses that threshold, the cruise phase disappears, the release point falls inside
+    the acceleration phase, and from there the speed at release is set by max_accel --
+    which never moved. The commanded release speed then stops rising however high
+    max_vel goes. Scaling all three keeps the profile's shape in normalised time, so the
+    release point stays in the same phase and the parameter keeps meaning what it says.
+    """
+    effort = release_speed / TOSS_MAX_VEL
+    return (release_speed, TOSS_MAX_ACCEL * effort, TOSS_MAX_DECEL * effort)
+
+
 # The base-to-target standoffs, in metres, that MoveToThrowPoseController draws from.
 # This is deliberately NOT MOVE_TO_TARGET_DISTANCE_BOUNDS: that interval, (0.5, 0.6), is
 # the range that gives a stable *grasp*, and a robot standing 0.55 m from the bin is
@@ -414,7 +445,12 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         # want to specify the target arm conf themselves.
         raise NotImplementedError
 
-    def reset(self, x: ObjectCentricState, params: Any) -> None:
+    def reset(
+        self,
+        x: ObjectCentricState,
+        params: Any,
+        release_speed: float = TOSS_MAX_VEL,
+    ) -> None:
         # Initialize the PyBullet interface if this is the first time ever.
         if self._pybullet_sim is None:
             self._pybullet_sim = PyBulletSim(x)
@@ -445,11 +481,12 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
             self._toss_dir = dq / s_total
         else:
             self._toss_dir = np.zeros(7)
+        max_vel, max_accel, max_decel = toss_profile_limits(release_speed)
         self._trajectory = _trapezoidal_motion_profile(
             s_total,
-            max_vel=np.deg2rad(140),
-            max_accel=np.deg2rad(300),
-            max_decel=np.deg2rad(200),
+            max_vel=max_vel,
+            max_accel=max_accel,
+            max_decel=max_decel,
             step_size=_CONTROL_DT,
         )
         self._start_joint_angles = np.array(curr_joint_angles[:7])

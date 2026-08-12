@@ -23,16 +23,24 @@ from spatialmath import SE2
 import kinder_models.dynamic3d.tossing.parameterized_skills
 from kinder_models.dynamic3d.shelf import parameterized_skills as shelf_skills
 from kinder_models.dynamic3d.tossing.parameterized_skills import (
+    TOSS_MAX_ACCEL,
+    TOSS_MAX_DECEL,
+    TOSS_MAX_VEL,
+    TOSS_RELEASE_ARM_CONF,
+    TOSS_WINDUP_ARM_CONF,
     create_lifted_controllers,
     get_target_robot_pose_from_parameters,
+    toss_profile_limits,
 )
 from kinder_models.dynamic3d.tossing.state_abstractions import (
     NEAR_BIN_TOL,
     THROW_STANDOFF_BOUNDS,
 )
 from kinder_models.dynamic3d.utils import (
+    _CONTROL_DT,
     WAYPOINT_TOL,
     PyBulletSim,
+    _trapezoidal_motion_profile,
     get_overhead_object_se2_pose,
     run_base_motion_planning,
 )
@@ -1687,3 +1695,76 @@ def test_move_to_throw_pose_samples_a_pose_on_the_bin_axis():
     assert draws[:, 1].min() < draws[:, 1].max()
 
     env.close()
+
+
+def test_toss_release_speed_defaults_to_the_previously_hardcoded_profile():
+    """The default must rebuild the exact profile the inline literals used to build.
+
+    TossController.reset passed max_vel/max_accel/max_decel as literals, so every
+    Tossing3D result on record -- the oracle demo, the throw-range constant, the
+    pick-and-toss tests -- was measured against that one profile. Making the speed a
+    parameter is only a mechanism change if the default reproduces it bit for bit, and
+    this asserts equality of the sampled trajectory rather than of the three limits, so
+    a future refactor of how the limits reach the profile still has to keep the motion.
+    """
+    total_dist = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    expected = _trapezoidal_motion_profile(
+        total_dist,
+        max_vel=np.deg2rad(140),
+        max_accel=np.deg2rad(300),
+        max_decel=np.deg2rad(200),
+        step_size=_CONTROL_DT,
+    )
+    max_vel, max_accel, max_decel = toss_profile_limits()
+    actual = _trapezoidal_motion_profile(
+        total_dist,
+        max_vel=max_vel,
+        max_accel=max_accel,
+        max_decel=max_decel,
+        step_size=_CONTROL_DT,
+    )
+    assert np.array_equal(actual, expected)
+
+
+def test_toss_release_speed_scales_every_limit_by_the_same_factor():
+    """A release speed is an effort scale on the whole profile, not on max_vel alone.
+
+    Scaling max_vel while max_accel and max_decel stay put moves the release point --
+    which fires at a fixed fraction of *distance* -- backwards out of the cruise phase,
+    where the speed is set by the acceleration limits instead. The commanded release
+    speed then stops tracking max_vel entirely. Scaling all three keeps the profile's
+    shape, so the release point stays in the same phase and the parameter keeps meaning
+    what its name says.
+    """
+    scale = 1.7
+    limits = toss_profile_limits(scale * TOSS_MAX_VEL)
+    expected = (scale * TOSS_MAX_VEL, scale * TOSS_MAX_ACCEL, scale * TOSS_MAX_DECEL)
+    assert np.allclose(limits, expected)
+
+
+def test_toss_release_speed_raises_the_speed_the_profile_commands_at_release():
+    """The point of the parameter: a faster setting must actually release faster.
+
+    Asserted against the profile rather than against a thrown cube, because this is the
+    controller's own arithmetic. Whether the arm tracks it, and where the cube lands, are
+    separate questions measured elsewhere.
+    """
+    total_dist = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    release_fraction = 0.46
+
+    def commanded_release_speed(release_speed):
+        max_vel, max_accel, max_decel = toss_profile_limits(release_speed)
+        trajectory = _trapezoidal_motion_profile(
+            total_dist,
+            max_vel=max_vel,
+            max_accel=max_accel,
+            max_decel=max_decel,
+            step_size=_CONTROL_DT,
+        )
+        final = trajectory[-1]
+        idx = int(np.argmax(trajectory / final >= release_fraction))
+        return (trajectory[idx] - trajectory[idx - 1]) / _CONTROL_DT
+
+    default = commanded_release_speed(TOSS_MAX_VEL)
+    faster = commanded_release_speed(2.5 * TOSS_MAX_VEL)
+    assert faster > 1.5 * default
