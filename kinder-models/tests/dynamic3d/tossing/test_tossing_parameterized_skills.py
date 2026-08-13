@@ -14,17 +14,27 @@ from kinder.envs.dynamic3d.object_types import (
     MujocoObjectTypeFeatures,
     MujocoTidyBotRobotObjectType,
 )
+from prpl_utils.utils import get_signed_angle_distance
 from relational_structs import Object, ObjectCentricState
 from relational_structs.spaces import ObjectCentricBoxSpace
 from relational_structs.utils import create_state_from_dict
 from spatialmath import SE2
 
-from kinder_models.dynamic3d.shelf.parameterized_skills import (
-    create_lifted_controllers as shelf_create_lifted_controllers,
-)
+import kinder_models.dynamic3d.tossing.parameterized_skills
+from kinder_models.dynamic3d.shelf import parameterized_skills as shelf_skills
 from kinder_models.dynamic3d.tossing.parameterized_skills import (
     create_lifted_controllers,
     get_target_robot_pose_from_parameters,
+)
+from kinder_models.dynamic3d.tossing.state_abstractions import (
+    NEAR_BIN_TOL,
+    THROW_STANDOFF_BOUNDS,
+)
+from kinder_models.dynamic3d.utils import (
+    WAYPOINT_TOL,
+    PyBulletSim,
+    get_overhead_object_se2_pose,
+    run_base_motion_planning,
 )
 
 kinder.register_all_environments()
@@ -1212,7 +1222,7 @@ def test_pick_ground_toss():
     state = env.observation_space.devectorize(obs)
 
     # Create the move-base controller.
-    controllers = shelf_create_lifted_controllers(env.action_space)
+    controllers = shelf_skills.create_lifted_controllers(env.action_space)
 
     # create the pick ground controller.
     lifted_controller = controllers["pick_shelf"]
@@ -1319,5 +1329,325 @@ def test_pick_ground_toss():
     print("cube_orientation", cube_orientation)
     print("robot base position", robot_base_position)
     print("distance", distance)
+
+    env.close()
+
+
+def test_move_to_throw_pose_controller():
+    """Test the throw-pose controller in the tossing environment with 1 cube."""
+
+    # Create the environment.
+    num_cubes = 1
+    env = kinder.make(
+        f"kinder/Tossing3D-o{num_cubes}-v0",
+        render_mode="rgb_array",
+        scene_bg=False,
+    )
+    if MAKE_VIDEOS:
+        env.unwrapped._object_centric_env.set_render_camera("task_view")  # type: ignore # pylint: disable=protected-access
+        env = RecordVideo(
+            env, "unit_test_videos", name_prefix=f"TidyBot3D-throw-pose-o{num_cubes}"
+        )
+
+    # Reset the environment and get the initial state.
+    obs, _ = env.reset(seed=125)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    state = env.observation_space.devectorize(obs)
+
+    # Ground the controller on (robot, target, held).
+    controllers = create_lifted_controllers(env.action_space)
+    lifted_controller = controllers["move_to_throw_pose"]
+    assert len(lifted_controller.variables) == 3
+    robot = _get_robot_from_state(state)
+    target = state.get_object_from_name("bin_0")
+    held = state.get_object_from_name("cube_0")
+    controller = lifted_controller.ground((robot, target, held))
+
+    # MoveToTargetGroundController returns the constant [0.5, 0.0]; this controller
+    # samples, and both components must vary. Where the draws land is asserted in the
+    # two tests below, against the predicate rather than the sampler's own bounds.
+    rng = np.random.default_rng(123)
+    draws = np.array([controller.sample_parameters(state, rng) for _ in range(20)])
+    assert draws[:, 0].min() < draws[:, 0].max()
+    assert draws[:, 1].min() < draws[:, 1].max()
+    params = draws[0]
+
+    # Record what the controller asks the base planner to ignore: the argument passed
+    # down is the thing under test, where a plan could succeed for unrelated reasons.
+    # Base collision checking is live in run_base_motion_planning (dynamic3d/utils.py).
+    recorded_disabled: list[list[str] | None] = []
+
+    def _recording_run_base_motion_planning(**kwargs):
+        """Record the call, then delegate to the real planner."""
+        recorded_disabled.append(kwargs.get("disable_collision_objects"))
+        return run_base_motion_planning(**kwargs)
+
+    # Swapped explicitly rather than with pytest's monkeypatch fixture: no test in
+    # kinder-models uses a fixture.
+    skills_module = kinder_models.dynamic3d.tossing.parameterized_skills
+    original_run_base_motion_planning = skills_module.run_base_motion_planning
+    skills_module.run_base_motion_planning = _recording_run_base_motion_planning
+
+    # The held object is not passed, so the controller must supply the exclusion.
+    try:
+        controller.reset(state, params)
+    finally:
+        skills_module.run_base_motion_planning = original_run_base_motion_planning
+    assert recorded_disabled == [["cube_0"]]
+    for _ in range(400):
+        action = controller.step()
+        obs, _, _, _, _ = env.step(action)
+        next_state = env.observation_space.devectorize(obs)
+        controller.observe(next_state)
+        state = next_state
+        if controller.terminated():
+            break
+    else:
+        assert False, "Controller did not terminate"
+
+    # The base ended up the sampled distance from the target, facing it.
+    robot = _get_robot_from_state(state)
+    target_pose = get_overhead_object_se2_pose(state, target)
+    expected_pose = get_target_robot_pose_from_parameters(
+        target_pose, params[0], params[1]
+    )
+    assert np.isclose(
+        state.get(robot, "pos_base_x"), expected_pose.x, atol=WAYPOINT_TOL
+    )
+    assert np.isclose(
+        state.get(robot, "pos_base_y"), expected_pose.y, atol=WAYPOINT_TOL
+    )
+    # The heading matters as much as the position: a throw is released along it.
+    assert np.isclose(
+        get_signed_angle_distance(
+            state.get(robot, "pos_base_rot"), expected_pose.theta()
+        ),
+        0.0,
+        atol=WAYPOINT_TOL,
+    )
+
+    env.close()
+
+
+def test_toss_from_windup_matches_split_controllers():
+    """Test the composed toss emits the actions of move_arm_to_conf then toss."""
+
+    # Create the environment.
+    num_cubes = 1
+    env = kinder.make(
+        f"kinder/Tossing3D-o{num_cubes}-v0",
+        render_mode="rgb_array",
+        scene_bg=False,
+    )
+    if MAKE_VIDEOS:
+        env.unwrapped._object_centric_env.set_render_camera("task_view")  # type: ignore # pylint: disable=protected-access
+        env = RecordVideo(
+            env, "unit_test_videos", name_prefix=f"TidyBot3D-toss-windup-o{num_cubes}"
+        )
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+
+    # The two demonstrated arm configurations, exactly as test_pick_toss uses them.
+    windup_conf = np.deg2rad([0, 50, 180, -110, 0, -100, 90])  # pre toss
+    toss_conf = np.deg2rad([0, 20, 180, -35, 0, 25, 90])  # toss
+
+    def _run_sequence(
+        steps: list[tuple[str, np.ndarray]],
+        controllers: dict,
+    ) -> list[list[np.ndarray]]:
+        """Run controllers back to back from a fresh reset, grouped by controller."""
+        obs, _ = env.reset(seed=125)
+        state = env.observation_space.devectorize(obs)
+        actions_per_controller: list[list[np.ndarray]] = []
+        for controller_name, params in steps:
+            robot = _get_robot_from_state(state)
+            controller = controllers[controller_name].ground((robot,))
+            controller.reset(state, params)
+            actions: list[np.ndarray] = []
+            for _ in range(400):
+                action = controller.step()
+                actions.append(np.array(action, dtype=np.float32, copy=True))
+                obs, _, _, _, _ = env.step(action)
+                state = env.observation_space.devectorize(obs)
+                controller.observe(state)
+                if controller.terminated():
+                    break
+            else:
+                assert False, "Controller did not terminate"
+            actions_per_controller.append(actions)
+        return actions_per_controller
+
+    controllers = create_lifted_controllers(env.action_space)
+    split_phases = _run_sequence(
+        [("move_arm_to_conf", windup_conf), ("toss", toss_conf)], controllers
+    )
+    composed_phases = _run_sequence(
+        [("toss_from_windup", np.array([windup_conf, toss_conf]))], controllers
+    )
+
+    # Both halves did real work, so the comparison below is not vacuous. Measured
+    # locally: 16 windup actions then 18 toss actions, 34 in total. Not asserted
+    # exactly, since they follow from a motion plan.
+    assert len(split_phases) == 2
+    assert min(len(phase) for phase in split_phases) >= 5
+
+    split_actions = [action for phase in split_phases for action in phase]
+    assert len(composed_phases) == 1
+    composed_actions = composed_phases[0]
+    assert len(composed_actions) == len(split_actions)
+    for composed_action, split_action in zip(
+        composed_actions, split_actions, strict=True
+    ):
+        assert np.array_equal(composed_action, split_action)
+
+    # Handing the factory a PyBullet sim to share must not change what comes out of it:
+    # that sim is the client every sub-controller plans in.
+    obs, _ = env.reset(seed=125)
+    initial_state = env.observation_space.devectorize(obs)
+    shared_sim = PyBulletSim(initial_state)
+    shared_controllers = create_lifted_controllers(
+        env.action_space, pybullet_sim=shared_sim
+    )
+    # Counted after the shared sim exists but before any controller has run, so the
+    # baseline is not inflated by whatever the earlier composed run held.
+    gc.collect()
+    clients_before = _count_connected_pybullet_clients()
+    shared_phases = _run_sequence(
+        [("toss_from_windup", np.array([windup_conf, toss_conf]))], shared_controllers
+    )
+    assert len(shared_phases) == 1
+    shared_actions = shared_phases[0]
+    assert len(shared_actions) == len(split_actions)
+    for shared_action, split_action in zip(shared_actions, split_actions, strict=True):
+        assert np.array_equal(shared_action, split_action)
+
+    # The shared sim is still the caller's to reuse, and nothing was leaked. The count
+    # alone is weak evidence of sharing, since the finalizer releases a private client
+    # too; what shows the shared sim was planned in is the identical actions above.
+    assert p.getConnectionInfo(physicsClientId=shared_sim.physics_client_id)[
+        "isConnected"
+    ]
+    gc.collect()
+    assert _count_connected_pybullet_clients() == clients_before
+
+    env.close()
+
+
+def test_toss_from_windup_samples_the_demonstrated_confs():
+    """Test the composed toss samples the two demonstrated confs, ignoring the rng."""
+
+    # Create the environment.
+    num_cubes = 1
+    env = kinder.make(
+        f"kinder/Tossing3D-o{num_cubes}-v0",
+        render_mode="rgb_array",
+        scene_bg=False,
+    )
+
+    # Reset the environment and get the initial state.
+    obs, _ = env.reset(seed=125)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    state = env.observation_space.devectorize(obs)
+
+    controllers = create_lifted_controllers(env.action_space)
+    robot = _get_robot_from_state(state)
+    controller = controllers["toss_from_windup"].ground((robot,))
+
+    params = controller.sample_parameters(state, np.random.default_rng(123))
+    other_params = controller.sample_parameters(state, np.random.default_rng(456))
+    assert np.array_equal(params, other_params)
+    assert np.allclose(params[0], np.deg2rad([0, 50, 180, -110, 0, -100, 90]))
+    assert np.allclose(params[1], np.deg2rad([0, 20, 180, -35, 0, 25, 90]))
+
+    env.close()
+
+
+def test_move_to_throw_pose_samples_a_throwable_standoff():
+    """The sampled standoff must be one a throw can actually be thrown from.
+
+    The grasping range (0.5-0.6 m) and THROW_STANDOFF_BOUNDS (1.20-1.65 m), which is
+    what NearBin admits, are disjoint. Asserts the containment directly rather than
+    the two numbers, so widening either interval keeps the test meaningful.
+    """
+    num_cubes = 1
+    env = kinder.make(
+        f"kinder/Tossing3D-o{num_cubes}-v0", render_mode="rgb_array", scene_bg=False
+    )
+    obs, _ = env.reset(seed=125)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    state = env.observation_space.devectorize(obs)
+
+    controllers = create_lifted_controllers(env.action_space)
+    lifted_controller = controllers["move_to_throw_pose"]
+    robot = _get_robot_from_state(state)
+    target = state.get_object_from_name("bin_0")
+    held = state.get_object_from_name("cube_0")
+    controller = lifted_controller.ground((robot, target, held))
+
+    rng = np.random.default_rng(123)
+    draws = np.array([controller.sample_parameters(state, rng) for _ in range(50)])
+
+    # Measured on the pose the parameters imply, not the sampled distance: NearBin's dx
+    # is bin.x - base.x = target_distance * cos(bin_yaw + rot). The two agree only
+    # because bin_init_region pins the bin's yaw at 0.
+    target_pose = get_overhead_object_se2_pose(state, target)
+    standoff = np.array(
+        [
+            target_pose.x
+            - get_target_robot_pose_from_parameters(target_pose, distance, rot).x
+            for distance, rot in draws
+        ]
+    )
+    low, high = THROW_STANDOFF_BOUNDS
+    assert np.all(standoff >= low), standoff.min()
+    assert np.all(standoff <= high), standoff.max()
+    # Still a sampler, not a constant.
+    assert draws[:, 0].min() < draws[:, 0].max()
+
+    env.close()
+
+
+def test_move_to_throw_pose_samples_a_pose_on_the_bin_axis():
+    """Every sampled pose must be one NearBin accepts, in y as well as in x.
+
+    NearBin also requires |dy| <= NEAR_BIN_TOL, since a radius test alone is satisfied
+    by a whole ring of positions. get_target_robot_pose_from_parameters places the base
+    at target_distance * sin(target_rot) off-axis. Asserted on the offset the
+    parameters imply, not the bounds, so it keeps its meaning if either is retuned.
+    """
+    num_cubes = 1
+    env = kinder.make(
+        f"kinder/Tossing3D-o{num_cubes}-v0", render_mode="rgb_array", scene_bg=False
+    )
+    obs, _ = env.reset(seed=125)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    state = env.observation_space.devectorize(obs)
+
+    controllers = create_lifted_controllers(env.action_space)
+    lifted_controller = controllers["move_to_throw_pose"]
+    robot = _get_robot_from_state(state)
+    target = state.get_object_from_name("bin_0")
+    held = state.get_object_from_name("cube_0")
+    controller = lifted_controller.ground((robot, target, held))
+
+    rng = np.random.default_rng(123)
+    draws = np.array([controller.sample_parameters(state, rng) for _ in range(50)])
+
+    # Measured on the pose the parameters imply: NearBin's dy is bin.y - base.y in
+    # world coordinates = target_distance * sin(bin_yaw + target_rot). The two agree
+    # only because bin_init_region pins the bin's yaw at 0.
+    target_pose = get_overhead_object_se2_pose(state, target)
+    off_axis = np.array(
+        [
+            abs(
+                target_pose.y
+                - get_target_robot_pose_from_parameters(target_pose, distance, rot).y
+            )
+            for distance, rot in draws
+        ]
+    )
+    assert np.all(off_axis <= NEAR_BIN_TOL), off_axis.max()
+    # Still a sampler, not a constant, in both components.
+    assert draws[:, 0].min() < draws[:, 0].max()
+    assert draws[:, 1].min() < draws[:, 1].max()
 
     env.close()
