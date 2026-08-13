@@ -23,16 +23,26 @@ from spatialmath import SE2
 import kinder_models.dynamic3d.tossing.parameterized_skills
 from kinder_models.dynamic3d.shelf import parameterized_skills as shelf_skills
 from kinder_models.dynamic3d.tossing.parameterized_skills import (
+    TOSS_DEFAULT_GRIPPER_RELEASE_MS,
+    TOSS_MAX_ACCEL,
+    TOSS_MAX_DECEL,
+    TOSS_MAX_VEL,
+    TOSS_RELEASE_ARM_CONF,
+    TOSS_SLICES_PER_CONTROL_STEP,
+    TOSS_WINDUP_ARM_CONF,
     create_lifted_controllers,
     get_target_robot_pose_from_parameters,
+    toss_profile_limits,
 )
 from kinder_models.dynamic3d.tossing.state_abstractions import (
     NEAR_BIN_TOL,
     THROW_STANDOFF_BOUNDS,
 )
 from kinder_models.dynamic3d.utils import (
+    _CONTROL_DT,
     WAYPOINT_TOL,
     PyBulletSim,
+    _trapezoidal_motion_profile,
     get_overhead_object_se2_pose,
     run_base_motion_planning,
 )
@@ -1649,5 +1659,224 @@ def test_move_to_throw_pose_samples_a_pose_on_the_bin_axis():
     # Still a sampler, not a constant, in both components.
     assert draws[:, 0].min() < draws[:, 0].max()
     assert draws[:, 1].min() < draws[:, 1].max()
+
+    env.close()
+
+
+def test_toss_release_speed_default_rebuilds_the_unscaled_profile():
+    """The default must rebuild the profile the literal 140/300/200 deg/s limits give.
+
+    Asserts equality of the sampled trajectory rather than of the three limits, so a
+    refactor of how the limits reach the profile still has to keep the motion.
+    """
+    total_dist = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    expected = _trapezoidal_motion_profile(
+        total_dist,
+        max_vel=np.deg2rad(140),
+        max_accel=np.deg2rad(300),
+        max_decel=np.deg2rad(200),
+        step_size=_CONTROL_DT,
+    )
+    max_vel, max_accel, max_decel = toss_profile_limits()
+    actual = _trapezoidal_motion_profile(
+        total_dist,
+        max_vel=max_vel,
+        max_accel=max_accel,
+        max_decel=max_decel,
+        step_size=_CONTROL_DT,
+    )
+    assert np.array_equal(actual, expected)
+
+
+def test_toss_release_speed_scales_every_limit_by_the_same_factor():
+    """A release speed is an effort scale on the whole profile, not on max_vel alone.
+
+    Scaling max_vel while max_accel and max_decel stay put moves the release point out
+    of the cruise phase, where the acceleration limits set the speed instead, so the
+    commanded release speed stops tracking max_vel.
+    """
+    # The invariant: the profile's shape. One factor on all three keeps the
+    # accel-to-vel and decel-to-vel ratios the same at every speed.
+    #
+    # Asserted a few ULP wide rather than bitwise: recovering a ratio divides back out
+    # a factor, and a/(b*c)*c need not return the starting bits. At 1.7x the three
+    # recovered ratios differ in the final bit.
+    shape = np.array([TOSS_MAX_ACCEL, TOSS_MAX_DECEL]) / TOSS_MAX_VEL
+    for scale in (0.25, 0.5, 1.0, 1.7, 2.0, 3.0):
+        max_vel, max_accel, max_decel = toss_profile_limits(scale * TOSS_MAX_VEL)
+        assert np.allclose([max_accel, max_decel] / max_vel, shape, rtol=1e-15), scale
+        assert max_vel == scale * TOSS_MAX_VEL
+
+    # Linear and proportional through the origin, not merely affine: an offset would
+    # make "twice the speed" mean other than twice the effort.
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        speed = rng.uniform(0.05, 5.0) * TOSS_MAX_VEL
+        factor = rng.uniform(0.05, 5.0)
+        scaled = np.array(toss_profile_limits(factor * speed))
+        assert np.allclose(
+            scaled, factor * np.array(toss_profile_limits(speed)), rtol=1e-12
+        )
+    assert np.array_equal(np.array(toss_profile_limits(0.0)), np.zeros(3))
+
+
+def test_toss_release_speed_raises_the_speed_the_profile_commands_at_release():
+    """The point of the parameter: a faster setting must actually release faster.
+
+    Asserted against the profile, not a thrown cube: this is the controller's
+    arithmetic, and whether the arm tracks it is measured elsewhere.
+    """
+    total_dist = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    release_fraction = 0.46
+
+    def commanded_release_speed(release_speed):
+        max_vel, max_accel, max_decel = toss_profile_limits(release_speed)
+        trajectory = _trapezoidal_motion_profile(
+            total_dist,
+            max_vel=max_vel,
+            max_accel=max_accel,
+            max_decel=max_decel,
+            step_size=_CONTROL_DT,
+        )
+        final = trajectory[-1]
+        idx = int(np.argmax(trajectory / final >= release_fraction))
+        return (trajectory[idx] - trajectory[idx - 1]) / _CONTROL_DT
+
+    default = commanded_release_speed(TOSS_MAX_VEL)
+    faster = commanded_release_speed(2.5 * TOSS_MAX_VEL)
+    assert faster > 1.5 * default
+
+
+def _default_speed_trajectory():
+    """The commanded distance profile of the shipped windup->release swing."""
+    s_total = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    max_vel, max_accel, max_decel = toss_profile_limits(TOSS_MAX_VEL)
+    trajectory = _trapezoidal_motion_profile(
+        s_total,
+        max_vel=max_vel,
+        max_accel=max_accel,
+        max_decel=max_decel,
+        step_size=_CONTROL_DT,
+    )
+    return trajectory, s_total
+
+
+def test_gripper_release_ms_splits_into_a_control_step_and_a_slice():
+    """The parameter is absolute wall-clock milliseconds from the start of the swing.
+
+    reset() only decomposes it; nothing rounds it to a control-step boundary.
+    """
+    assert TOSS_SLICES_PER_CONTROL_STEP == 100
+    for ms, expected in [(0, (0, 0)), (723, (7, 23)), (100, (1, 0)), (2399, (23, 99))]:
+        assert divmod(ms, TOSS_SLICES_PER_CONTROL_STEP) == expected
+
+
+def test_the_default_release_ms_falls_at_fraction_046_of_the_swing():
+    """720 ms is where fraction 0.46 of the swing falls at the default speed.
+
+    Measured on the motion-planned path, not the nominal
+    TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF difference: reset() profiles both
+    endpoints through run_motion_planning, which moves the crossing 3 ms. Nominal
+    arithmetic gives 723, and a live rollout lands the cube 52 mm further with 723.
+
+    The 0.005 tolerance holds on either path, so this does not distinguish 720 from
+    723; the consuming repo's live-rollout fidelity test is what does.
+
+    Not the real robot's own 600: that normalises by L-infinity (125.0 deg) and
+    finishes in 1476 ms, so its 600 ms is fraction 0.4107, while 600 ms here is 0.3449.
+    """
+    assert TOSS_DEFAULT_GRIPPER_RELEASE_MS == 720
+
+    trajectory, s_total = _default_speed_trajectory()
+    step, slice_ = divmod(TOSS_DEFAULT_GRIPPER_RELEASE_MS, TOSS_SLICES_PER_CONTROL_STEP)
+    # Linear interpolation between the two samples the release falls between, which is
+    # how the commanded distance actually varies inside one held control period.
+    below, above = float(trajectory[step]), float(trajectory[step + 1])
+    covered = below + (above - below) * (slice_ / TOSS_SLICES_PER_CONTROL_STEP)
+    assert abs(covered / s_total - 0.46) < 0.005
+
+
+def test_a_release_ms_past_the_swing_never_opens_the_gripper():
+    """The degenerate corner is reachable on purpose, not clamped away.
+
+    The swing lasts 1700 ms at 140 deg/s, so a release at 2400 ms means the cube is
+    still held when the controller terminates -- a real region of the
+    (release_speed, gripper_release_ms) space a characterisation sweep must reach.
+    """
+    trajectory, _ = _default_speed_trajectory()
+    duration_ms = (len(trajectory) - 1) * TOSS_SLICES_PER_CONTROL_STEP
+    assert duration_ms == 1700
+    late_step, _ = divmod(2400, TOSS_SLICES_PER_CONTROL_STEP)
+    assert late_step >= len(trajectory)
+
+
+def test_toss_schedules_its_release_at_the_requested_millisecond():
+    """End to end: exactly one action of a real toss is a control schedule.
+
+    That the schedule reaches the simulator, lands on the millisecond
+    gripper_release_ms asked for rather than the next control-step boundary, and holds
+    the gripper closed for that step's slices but the last. Every other action is the
+    plain (18,) vector.
+    """
+    requested_ms = 812  # deliberately not a multiple of 100
+    expected_step, expected_slice = divmod(requested_ms, TOSS_SLICES_PER_CONTROL_STEP)
+
+    env = kinder.make("kinder/Tossing3D-o1-v0", render_mode="rgb_array", scene_bg=False)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    obs, _ = env.reset(seed=125)
+    state = env.observation_space.devectorize(obs)
+    shelf = shelf_skills.create_lifted_controllers(env.action_space)
+    tossing = create_lifted_controllers(env.action_space)
+
+    def _run(controller, params, **reset_kwargs):
+        """Drive one controller to termination, returning the actions it emitted."""
+        nonlocal state
+        controller.reset(state, params, **reset_kwargs)
+        emitted = []
+        for _ in range(400):
+            action = controller.step()
+            emitted.append(np.array(action, copy=True))
+            observation, _, _, _, _ = env.step(action)
+            state = env.observation_space.devectorize(observation)
+            controller.observe(state)
+            if controller.terminated():
+                return emitted
+        assert False, "Controller did not terminate"
+
+    # The cube has to be *in* the gripper, or the release is a no-op: an empty hand
+    # commands 0.0 both sides of the release.
+    robot = _get_robot_from_state(state)
+    pick = shelf["pick_shelf"].ground((robot, state.get_object_from_name("cube_0")))
+    _run(pick, pick.sample_parameters(state, np.random.default_rng(123)))
+
+    robot = _get_robot_from_state(state)
+    move = tossing["move_to_target"].ground(
+        (robot, state.get_object_from_name("bin_0"))
+    )
+    _run(move, np.array([1.35, 0.0]), disable_collision_objects=["cube_0"])
+
+    robot = _get_robot_from_state(state)
+    _run(tossing["move_arm_to_conf"].ground((robot,)), TOSS_WINDUP_ARM_CONF)
+
+    robot = _get_robot_from_state(state)
+    toss = tossing["toss"].ground((robot,))
+    actions = _run(toss, TOSS_RELEASE_ARM_CONF, gripper_release_ms=requested_ms)
+
+    scheduled = [i for i, action in enumerate(actions) if action.ndim == 2]
+    assert scheduled == [expected_step]
+    schedule = actions[expected_step]
+    # A schedule covers the whole control period, so release is located by index.
+    assert schedule.shape == (TOSS_SLICES_PER_CONTROL_STEP, 18)
+    assert np.all(schedule[:expected_slice, 10] == schedule[0, 10])
+    assert schedule[0, 10] > 0.0
+    assert np.all(schedule[expected_slice:, 10] == 0.0)
+
+    # Only the gripper column varies; the arm is commanded identically across slices.
+    columns = [c for c in range(18) if c != 10]
+    assert np.all(schedule[:, columns] == schedule[0, columns])
+
+    # Everything before the release still holds the cube, everything after is open.
+    assert all(action[10] > 0.0 for action in actions[:expected_step])
+    assert all(action[10] == 0.0 for action in actions[expected_step + 1 :])
 
     env.close()

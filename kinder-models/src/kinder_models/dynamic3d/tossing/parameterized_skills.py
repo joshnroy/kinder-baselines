@@ -7,6 +7,9 @@ from bilevel_planning.structs import (
     GroundParameterizedController,
     LiftedParameterizedController,
 )
+from kinder.envs.dynamic3d.mujoco_utils import (
+    CONTROL_SCHEDULE_TIMESTEP,
+)
 from kinder.envs.dynamic3d.object_types import (
     MujocoMovableObjectType,
     MujocoObjectType,
@@ -53,6 +56,37 @@ from kinder_models.dynamic3d.utils import (
 # back, then swing forward and release. The same confs the pick-and-toss tests use.
 TOSS_WINDUP_ARM_CONF = np.deg2rad([0.0, 50.0, 180.0, -110.0, 0.0, -100.0, 90.0])
 TOSS_RELEASE_ARM_CONF = np.deg2rad([0.0, 20.0, 180.0, -35.0, 0.0, 25.0, 90.0])
+
+# The swing's own limits, deliberately over-driving _ARM_MAX_VEL (70-80 deg/s per
+# joint): a toss throws hard on purpose. Also the release-speed parameter's default.
+TOSS_MAX_VEL = np.deg2rad(140.0)
+TOSS_MAX_ACCEL = np.deg2rad(300.0)
+TOSS_MAX_DECEL = np.deg2rad(200.0)
+
+
+def toss_profile_limits(
+    release_speed: float = TOSS_MAX_VEL,
+) -> tuple[float, float, float]:
+    """The (max_vel, max_accel, max_decel) triple a toss at release_speed is timed by.
+
+    Scaling all three by one factor is what makes this an effort and not a speed cap:
+    raising max_vel alone turns the profile triangular and moves the release into the
+    acceleration phase, where max_accel sets the speed at release.
+    """
+    effort = release_speed / TOSS_MAX_VEL
+    return (release_speed, TOSS_MAX_ACCEL * effort, TOSS_MAX_DECEL * effort)
+
+
+# Schedulable slices in one control period: the finest release timing the simulator
+# honours, 1 ms, matching the real robot's 1 kHz LOW_LEVEL_SERVOING loop.
+TOSS_SLICES_PER_CONTROL_STEP = int(round(_CONTROL_DT / CONTROL_SCHEDULE_TIMESTEP))
+
+# When the gripper opens, in milliseconds from the start of the swing -- the same
+# quantity the real robot's movej_primitive.execute() takes. Not the real robot's own
+# 600, and not 723: 723 lands the cube 52 mm further. Re-derive by running the swing
+# and finding the crossing, not by recomputing from the confs.
+TOSS_DEFAULT_GRIPPER_RELEASE_MS = 720
+
 
 # The base-to-target standoffs, in metres, that MoveToThrowPoseController draws from.
 # Not MOVE_TO_TARGET_DISTANCE_BOUNDS = (0.5, 0.6), which is the grasping range. Brackets
@@ -383,20 +417,37 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         self._current_params: np.ndarray | None = None
         self._current_arm_joint_plan: list[JointPositions] | None = None
         self._pybullet_sim: PyBulletSim | None = None
-        # Fraction of toss path at which to release gripper.
-        self._release_fraction: float = 0.46
         self._step_idx: int = 0
         self._toss_dir: np.ndarray = np.zeros(7)
         self._trajectory: np.ndarray = np.array([])
         self._has_released: bool = False
         self._start_joint_angles: np.ndarray = np.zeros(7)
+        # The control step the gripper opens on, and the millisecond within it.
+        self._release_step: int = 0
+        self._release_slice: int = 0
 
     def sample_parameters(self, x: ObjectCentricState, rng: np.random.Generator) -> Any:
         # We can later implement sampling if it's helpful, but usually the user would
         # want to specify the target arm conf themselves.
         raise NotImplementedError
 
-    def reset(self, x: ObjectCentricState, params: Any) -> None:
+    def reset(
+        self,
+        x: ObjectCentricState,
+        params: Any,
+        release_speed: float = TOSS_MAX_VEL,
+        gripper_release_ms: int = TOSS_DEFAULT_GRIPPER_RELEASE_MS,
+    ) -> None:
+        """Plan the swing, and fix the millisecond the gripper opens on.
+
+        release_speed and gripper_release_ms are the two knobs the real robot's
+        movej_primitive.execute() takes, as max_vel and gripper_release_ms.
+
+        gripper_release_ms is NOT clamped to the swing's duration: a value at or past
+        the end means the gripper never opens and the cube is never thrown. The swing
+        lasts 1700 ms at 140 deg/s and 3100 ms at 60 deg/s, so where that boundary
+        falls depends on both parameters at once.
+        """
         # Initialize the PyBullet interface if this is the first time ever.
         if self._pybullet_sim is None:
             self._pybullet_sim = PyBulletSim(x)
@@ -422,19 +473,27 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         curr_joint_angles = self._get_current_robot_arm_conf()
         final_joint_angles = self._current_arm_joint_plan[-1]
         dq = np.subtract(final_joint_angles, curr_joint_angles)[:7]
+        # Deliberately not the controller the real robot runs: what matches is the
+        # parameter space -- the same knobs in the same units -- not the trajectory.
+        # Do not align this with the siblings that call _compute_per_joint_profile.
         s_total = float(np.linalg.norm(dq))
         if s_total > 1e-4:
             self._toss_dir = dq / s_total
         else:
             self._toss_dir = np.zeros(7)
+        max_vel, max_accel, max_decel = toss_profile_limits(release_speed)
         self._trajectory = _trapezoidal_motion_profile(
             s_total,
-            max_vel=np.deg2rad(140),
-            max_accel=np.deg2rad(300),
-            max_decel=np.deg2rad(200),
+            max_vel=max_vel,
+            max_accel=max_accel,
+            max_decel=max_decel,
             step_size=_CONTROL_DT,
         )
         self._start_joint_angles = np.array(curr_joint_angles[:7])
+        # Split into the control step the release lands in and the slice within it.
+        self._release_step, self._release_slice = divmod(
+            int(gripper_release_ms), TOSS_SLICES_PER_CONTROL_STEP
+        )
         self._has_released = False
         self._step_idx = 0
 
@@ -443,6 +502,13 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         return self._step_idx >= len(self._trajectory)
 
     def step(self) -> Array:
+        """The swing's command for one control step, opening the gripper mid-step.
+
+        Returns the usual (18,) action, except on the control step the release falls
+        inside, where it returns a (TOSS_SLICES_PER_CONTROL_STEP, 18) schedule holding
+        the cube for the first release_slice milliseconds and open for the rest, so
+        gripper_release_ms means the millisecond it names.
+        """
         assert self._current_arm_joint_plan is not None
         gripper_pose = self._get_current_robot_gripper_pose()
         action = np.zeros(18, dtype=np.float32)
@@ -466,21 +532,26 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         # Velocity feedforward along the toss direction.
         action[11:18] = self._toss_dir * (ds * kv)
 
-        # Determine release point based on fraction of total distance.
-        s_total = self._trajectory[-1] if len(self._trajectory) > 0 else 0.0
-        fraction_covered = s / s_total if s_total > 0 else 1.0
-        should_release = (
-            self._has_released or fraction_covered >= self._release_fraction
-        )
-
-        if should_release:
-            action[10] = 0.0
-            self._has_released = True
-        else:
-            action[10] = gripper_pose
-
+        # Open the gripper on the step reset() computed, at the millisecond it computed.
+        released_before_now = self._has_released or self._step_idx > self._release_step
+        opens_this_step = self._step_idx == self._release_step
         self._step_idx += 1
-        return action
+
+        if released_before_now:
+            action[10] = 0.0
+            return action
+        if not opens_this_step:
+            action[10] = gripper_pose
+            return action
+
+        self._has_released = True
+        if self._release_slice == 0:
+            action[10] = 0.0
+            return action
+        schedule = np.repeat(action[None], TOSS_SLICES_PER_CONTROL_STEP, axis=0)
+        schedule[: self._release_slice, 10] = gripper_pose
+        schedule[self._release_slice :, 10] = 0.0
+        return schedule
 
     def observe(self, x: ObjectCentricState) -> None:
         self._last_state = x
