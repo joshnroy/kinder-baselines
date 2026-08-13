@@ -440,6 +440,11 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         curr_joint_angles = self._get_current_robot_arm_conf()
         final_joint_angles = self._current_arm_joint_plan[-1]
         dq = np.subtract(final_joint_angles, curr_joint_angles)[:7]
+        # This controller is deliberately not the one the real robot runs: what we
+        # match is the *parameter space* -- the same knobs in the same units -- not
+        # the trajectory. So do not "fix" it into line with the siblings that call
+        # _compute_per_joint_profile; that would make the toss slower, not faster.
+        # https://app.notion.com/p/3bb33470fbc5812e965acd3bcb1255e0
         s_total = float(np.linalg.norm(dq))
         if s_total > 1e-4:
             self._toss_dir = dq / s_total
