@@ -27,9 +27,12 @@ from kinder_models.dynamic3d.tossing.parameterized_skills import (
     TOSS_MAX_DECEL,
     TOSS_MAX_VEL,
     TOSS_RELEASE_ARM_CONF,
+    TOSS_RELEASE_FRACTION,
+    TOSS_SLICES_PER_CONTROL_STEP,
     TOSS_WINDUP_ARM_CONF,
     create_lifted_controllers,
     get_target_robot_pose_from_parameters,
+    release_millisecond,
     toss_profile_limits,
 )
 from kinder_models.dynamic3d.tossing.state_abstractions import (
@@ -1792,3 +1795,188 @@ def test_toss_release_speed_raises_the_speed_the_profile_commands_at_release():
     default = commanded_release_speed(TOSS_MAX_VEL)
     faster = commanded_release_speed(2.5 * TOSS_MAX_VEL)
     assert faster > 1.5 * default
+
+
+def _toss_trajectory(release_speed):
+    """The commanded profile a toss at release_speed swings through."""
+    total_dist = float(np.linalg.norm(TOSS_RELEASE_ARM_CONF - TOSS_WINDUP_ARM_CONF))
+    max_vel, max_accel, max_decel = toss_profile_limits(release_speed)
+    trajectory = _trapezoidal_motion_profile(
+        total_dist,
+        max_vel=max_vel,
+        max_accel=max_accel,
+        max_decel=max_decel,
+        step_size=_CONTROL_DT,
+    )
+    return trajectory, total_dist
+
+
+def _realised_fraction(trajectory, total_dist, millisecond):
+    """The share of the path the profile has covered at an absolute millisecond."""
+    index, within = divmod(millisecond, TOSS_SLICES_PER_CONTROL_STEP)
+    covered = float(trajectory[index])
+    if within and index + 1 < len(trajectory):
+        span = float(trajectory[index + 1]) - covered
+        covered += span * within / TOSS_SLICES_PER_CONTROL_STEP
+    return covered / total_dist
+
+
+def test_release_millisecond_collapses_the_release_fraction_sawtooth():
+    """The whole point: the realised release fraction must stop moving with speed.
+
+    The gripper opened on whichever control step first crossed the fraction, and a
+    control step is 100 ms, so the overshoot was whatever the swing covered in up to a
+    tenth of a second -- larger the faster the swing, and resetting each time the
+    crossing happened to land near a step boundary. That is a sawtooth, not a bias, so
+    it could not be calibrated away, and it is what made the release-speed dial
+    non-monotone: two speeds 5 deg/s apart could release a whole control step apart.
+
+    Both arms are asserted here rather than only the new one, because "the spread got
+    smaller" is only meaningful against the spread it replaced.
+    """
+    old_fractions = []
+    new_fractions = []
+    for degrees in range(60, 245, 5):
+        trajectory, total_dist = _toss_trajectory(np.deg2rad(float(degrees)))
+
+        # The rule this replaces: first control step at or past the fraction, measured
+        # against the profile's last sample.
+        end = float(trajectory[-1])
+        step = int(np.argmax(trajectory / end >= TOSS_RELEASE_FRACTION))
+        old_fractions.append(float(trajectory[step]) / end)
+
+        millisecond = release_millisecond(trajectory, total_dist)
+        new_fractions.append(_realised_fraction(trajectory, total_dist, millisecond))
+
+    old_spread = max(old_fractions) - min(old_fractions)
+    new_spread = max(new_fractions) - min(new_fractions)
+    assert old_spread > 0.12, old_spread
+    assert new_spread < 0.002, new_spread
+    assert old_spread > 50 * new_spread
+    assert min(new_fractions) >= TOSS_RELEASE_FRACTION
+    assert max(new_fractions) < TOSS_RELEASE_FRACTION + 0.002
+
+
+def test_release_millisecond_never_opens_before_the_fraction_is_reached():
+    """Rounding up preserves the direction the control-step rule already rounded.
+
+    Releasing early is not symmetric with releasing late here: the fraction is tuned so
+    the cube leaves the gripper on the way up, and opening before the arm has covered
+    the path throws short. The quantisation is 100x finer, but it still only ever errs
+    late.
+    """
+    for degrees in range(60, 245, 5):
+        trajectory, total_dist = _toss_trajectory(np.deg2rad(float(degrees)))
+        millisecond = release_millisecond(trajectory, total_dist)
+        assert (
+            _realised_fraction(trajectory, total_dist, millisecond)
+            >= TOSS_RELEASE_FRACTION
+        )
+        earlier = _realised_fraction(trajectory, total_dist, millisecond - 1)
+        assert earlier < TOSS_RELEASE_FRACTION
+
+
+def test_release_millisecond_measures_against_the_path_not_the_last_sample():
+    """The denominator is the true path length, which the last profile sample is not.
+
+    _trapezoidal_motion_profile samples on arange(0, duration + step, step), so its last
+    sample sits past the motion's end, where the decel branch is already falling. It
+    therefore under-reports the path by up to about 1.1%, and by a different amount at
+    every speed. Left in place that alone would have kept a 0.0053-wide sawtooth in the
+    realised fraction -- about four times what millisecond quantisation leaves -- so the
+    denominator, not the timing, would have become the dominant error.
+    """
+    ends = []
+    for degrees in range(60, 245, 5):
+        trajectory, total_dist = _toss_trajectory(np.deg2rad(float(degrees)))
+        ends.append(float(trajectory[-1]) / total_dist)
+        assert float(trajectory[-1]) <= total_dist
+
+        against_path = release_millisecond(trajectory, total_dist)
+        against_last = release_millisecond(trajectory, float(trajectory[-1]))
+        assert against_last <= against_path
+
+    assert min(ends) < 0.99
+    assert max(ends) < 1.0
+
+
+def test_release_millisecond_handles_a_profile_that_never_gets_there():
+    """A degenerate profile still releases, rather than terminate holding the cube."""
+    assert release_millisecond(np.array([0.0, 1.0, 2.0]), 100.0) == (
+        2 * TOSS_SLICES_PER_CONTROL_STEP
+    )
+    assert release_millisecond(np.array([0.0]), 1.0) == 0
+    assert release_millisecond(np.array([]), 1.0) == 0
+
+
+def test_toss_schedules_its_release_inside_one_control_step():
+    """End to end: exactly one action of a real toss is a control schedule.
+
+    The controller-level claim the arithmetic above cannot make: that the schedule
+    reaches the simulator, that it covers exactly the milliseconds reset() computed, and
+    that the gripper is held closed for all of them but the last. Every other action of
+    the swing stays the plain (18,) vector it always was.
+    """
+    env = kinder.make("kinder/Tossing3D-o1-v0", render_mode="rgb_array", scene_bg=False)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    obs, _ = env.reset(seed=125)
+    assert isinstance(env.observation_space, ObjectCentricBoxSpace)
+    state = env.observation_space.devectorize(obs)
+    shelf = shelf_skills.create_lifted_controllers(env.action_space)
+    tossing = create_lifted_controllers(env.action_space)
+
+    def _run(controller, params, **reset_kwargs):
+        """Drive one controller to termination, returning the actions it emitted."""
+        nonlocal state
+        controller.reset(state, params, **reset_kwargs)
+        emitted = []
+        for _ in range(400):
+            action = controller.step()
+            emitted.append(np.array(action, copy=True))
+            observation, _, _, _, _ = env.step(action)
+            state = env.observation_space.devectorize(observation)
+            controller.observe(state)
+            if controller.terminated():
+                return emitted
+        assert False, "Controller did not terminate"
+
+    # The cube has to be *in* the gripper, or the release is a no-op: the gripper
+    # command comes from the robot's own grasp state, so an empty hand commands 0.0
+    # both sides of the release and the schedule would carry no information.
+    robot = _get_robot_from_state(state)
+    pick = shelf["pick_shelf"].ground((robot, state.get_object_from_name("cube_0")))
+    _run(pick, pick.sample_parameters(state, np.random.default_rng(123)))
+
+    robot = _get_robot_from_state(state)
+    move = tossing["move_to_target"].ground(
+        (robot, state.get_object_from_name("bin_0"))
+    )
+    _run(move, np.array([1.35, 0.0]), disable_collision_objects=["cube_0"])
+
+    robot = _get_robot_from_state(state)
+    _run(tossing["move_arm_to_conf"].ground((robot,)), TOSS_WINDUP_ARM_CONF)
+
+    robot = _get_robot_from_state(state)
+    toss = tossing["toss"].ground((robot,))
+    actions = _run(toss, TOSS_RELEASE_ARM_CONF)
+    release_step = toss._release_step  # pylint: disable=protected-access
+    release_slice = toss._release_slice  # pylint: disable=protected-access
+
+    scheduled = [i for i, action in enumerate(actions) if action.ndim == 2]
+    assert scheduled == [release_step]
+    assert release_slice > 0
+    schedule = actions[release_step]
+    assert schedule.shape == (release_slice + 1, 18)
+    assert np.all(schedule[:-1, 10] == schedule[0, 10])
+    assert schedule[0, 10] > 0.0
+    assert schedule[-1, 10] == 0.0
+
+    # Only the gripper column varies; the arm is commanded exactly as it was before.
+    columns = [c for c in range(18) if c != 10]
+    assert np.all(schedule[:, columns] == schedule[0, columns])
+
+    # Everything before the release still holds the cube, everything after is open.
+    assert all(action[10] > 0.0 for action in actions[:release_step])
+    assert all(action[10] == 0.0 for action in actions[release_step + 1 :])
+
+    env.close()

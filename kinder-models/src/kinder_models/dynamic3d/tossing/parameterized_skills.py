@@ -1,11 +1,15 @@
 """Parameterized skills for the TidyBot3D tossing environment."""
 
+import math
 from typing import Any
 
 import numpy as np
 from bilevel_planning.structs import (
     GroundParameterizedController,
     LiftedParameterizedController,
+)
+from kinder.envs.dynamic3d.mujoco_utils import (
+    CONTROL_SCHEDULE_TIMESTEP,
 )
 from kinder.envs.dynamic3d.object_types import (
     MujocoMovableObjectType,
@@ -65,6 +69,11 @@ TOSS_MAX_VEL = np.deg2rad(140.0)
 TOSS_MAX_ACCEL = np.deg2rad(300.0)
 TOSS_MAX_DECEL = np.deg2rad(200.0)
 
+# The fraction of the swing's path at which the gripper opens. Was a TossController
+# instance attribute, and is a module constant now only so release_millisecond can
+# default to it.
+TOSS_RELEASE_FRACTION = 0.46
+
 
 def toss_profile_limits(
     release_speed: float = TOSS_MAX_VEL,
@@ -84,6 +93,63 @@ def toss_profile_limits(
     """
     effort = release_speed / TOSS_MAX_VEL
     return (release_speed, TOSS_MAX_ACCEL * effort, TOSS_MAX_DECEL * effort)
+
+
+# How many schedulable slices there are inside one control period. MujocoEnv.step holds
+# one row of a control schedule for CONTROL_SCHEDULE_TIMESTEP, so this is the finest
+# release timing the simulator will honour.
+TOSS_SLICES_PER_CONTROL_STEP = int(round(_CONTROL_DT / CONTROL_SCHEDULE_TIMESTEP))
+
+
+def release_millisecond(
+    trajectory: np.ndarray,
+    path_length: float,
+    release_fraction: float = TOSS_RELEASE_FRACTION,
+    slices_per_step: int = TOSS_SLICES_PER_CONTROL_STEP,
+) -> int:
+    """When the commanded profile covers release_fraction of the path, in milliseconds.
+
+    trajectory is _trapezoidal_motion_profile's output: the commanded distance along the
+    path at each control step, so the crossing is arithmetic rather than something to
+    search for. Between two samples the commanded distance is interpolated linearly,
+    which is exact through the profile's constant-velocity phase and is the same
+    first-order reading of the profile that TossController.step's own finite-difference
+    velocity already takes.
+
+    The answer is an absolute millisecond from the start of the swing, and the caller
+    divmods it into (control step, slice within that step). That is deliberate: a future
+    "open the gripper N ms earlier/later" parameter is then one addition here, not a
+    rewrite of the decomposition.
+
+    The denominator is path_length -- the true straight-line distance the profile was
+    built for -- and NOT trajectory[-1]. The two differ by up to about 1.1% (measured
+    0.9893-0.9999 of true across 60-240 deg/s) because the profile's time grid,
+    arange(0, duration + step, step), overshoots the motion's duration and the decel
+    branch is falling by then. Using the last sample made the *realised* release
+    fraction sawtooth by 0.0053 with speed on its own, which is about four times the
+    0.0014 that millisecond quantisation leaves, so it would have dominated the very
+    jitter this scheduling exists to remove.
+    """
+    assert slices_per_step >= 1
+    last_millisecond = (len(trajectory) - 1) * slices_per_step
+    if len(trajectory) < 2 or path_length <= 0:
+        return 0
+    threshold = release_fraction * path_length
+    crossed = np.flatnonzero(trajectory >= threshold)
+    if len(crossed) == 0:
+        # The profile never reaches the fraction; release as late as the swing allows.
+        return last_millisecond
+    index = int(crossed[0])
+    if index == 0:
+        return 0
+    below, above = float(trajectory[index - 1]), float(trajectory[index])
+    if above <= below:
+        return index * slices_per_step
+    covered = (threshold - below) / (above - below)
+    # Round up, so the gripper never opens before the fraction is reached -- the same
+    # direction the control-step rule rounded, just 100x finer.
+    within = int(math.ceil(covered * slices_per_step))
+    return min((index - 1) * slices_per_step + within, last_millisecond)
 
 
 # The base-to-target standoffs, in metres, that MoveToThrowPoseController draws from.
@@ -433,12 +499,15 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         self._current_arm_joint_plan: list[JointPositions] | None = None
         self._pybullet_sim: PyBulletSim | None = None
         # Fraction of toss path at which to release gripper.
-        self._release_fraction: float = 0.46
+        self._release_fraction: float = TOSS_RELEASE_FRACTION
         self._step_idx: int = 0
         self._toss_dir: np.ndarray = np.zeros(7)
         self._trajectory: np.ndarray = np.array([])
         self._has_released: bool = False
         self._start_joint_angles: np.ndarray = np.zeros(7)
+        # The control step the gripper opens on, and the millisecond within it.
+        self._release_step: int = 0
+        self._release_slice: int = 0
 
     def sample_parameters(self, x: ObjectCentricState, rng: np.random.Generator) -> Any:
         # We can later implement sampling if it's helpful, but usually the user would
@@ -490,6 +559,16 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
             step_size=_CONTROL_DT,
         )
         self._start_joint_angles = np.array(curr_joint_angles[:7])
+        # Where the swing crosses the release fraction. Known exactly once the profile
+        # is known, so step() schedules the opening rather than testing for it.
+        self._release_step, self._release_slice = divmod(
+            release_millisecond(
+                self._trajectory,
+                s_total,
+                release_fraction=self._release_fraction,
+            ),
+            TOSS_SLICES_PER_CONTROL_STEP,
+        )
         self._has_released = False
         self._step_idx = 0
 
@@ -498,6 +577,18 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         return self._step_idx >= len(self._trajectory)
 
     def step(self) -> Array:
+        """The swing's command for one control step, opening the gripper mid-step.
+
+        Returns the usual (18,) action, except on the one control step the release falls
+        inside, where it returns a (release_slice + 1, 18) control schedule: the held
+        command for release_slice milliseconds, then the same command with the gripper
+        open. MujocoEnv.step reads that as "switch after release_slice ms".
+
+        The release used to be a test run once per control step, so it could only take
+        effect on a 100 ms boundary -- 200 physics ticks late at worst. That made the
+        realised release fraction sawtooth between 0.4644 and 0.5868 against its 0.46
+        target as release_speed varied, which is what made the speed dial non-monotone.
+        """
         assert self._current_arm_joint_plan is not None
         gripper_pose = self._get_current_robot_gripper_pose()
         action = np.zeros(18, dtype=np.float32)
@@ -521,21 +612,26 @@ class TossController(GroundParameterizedController[ObjectCentricState, Array]):
         # Velocity feedforward along the toss direction.
         action[11:18] = self._toss_dir * (ds * kv)
 
-        # Determine release point based on fraction of total distance.
-        s_total = self._trajectory[-1] if len(self._trajectory) > 0 else 0.0
-        fraction_covered = s / s_total if s_total > 0 else 1.0
-        should_release = (
-            self._has_released or fraction_covered >= self._release_fraction
-        )
-
-        if should_release:
-            action[10] = 0.0
-            self._has_released = True
-        else:
-            action[10] = gripper_pose
-
+        # Open the gripper on the step reset() computed, at the millisecond it computed.
+        released_before_now = self._has_released or self._step_idx > self._release_step
+        opens_this_step = self._step_idx == self._release_step
         self._step_idx += 1
-        return action
+
+        if released_before_now:
+            action[10] = 0.0
+            return action
+        if not opens_this_step:
+            action[10] = gripper_pose
+            return action
+
+        self._has_released = True
+        if self._release_slice == 0:
+            action[10] = 0.0
+            return action
+        schedule = np.repeat(action[None], self._release_slice + 1, axis=0)
+        schedule[:-1, 10] = gripper_pose
+        schedule[-1, 10] = 0.0
+        return schedule
 
     def observe(self, x: ObjectCentricState) -> None:
         self._last_state = x
