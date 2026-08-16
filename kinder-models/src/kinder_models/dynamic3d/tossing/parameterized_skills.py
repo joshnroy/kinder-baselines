@@ -11,6 +11,7 @@ from bilevel_planning.structs import (
 from bilevel_planning.trajectory_samplers.trajectory_sampler import (
     TrajectorySamplingFailure,
 )
+from gymnasium.spaces import Box
 from kinder.envs.dynamic3d.object_types import (
     MujocoMovableObjectType,
     MujocoObjectType,
@@ -55,6 +56,8 @@ from kinder_models.dynamic3d.utils import (
     GRIPPER_CLOSED_THRESHOLD,
     GRIPPER_OPEN_COMMAND_TOLERANCE,
     MINIMUM_HOLDING_HEIGHT,
+    MOVE_TO_TARGET_DISTANCE_BOUNDS,
+    MOVE_TO_TARGET_ROT_BOUNDS,
     WAYPOINT_TOLERANCE,
     WORLD_X_BOUNDS,
     WORLD_Y_BOUNDS,
@@ -702,16 +705,23 @@ class OpenGripperController(GroundParameterizedController[ObjectCentricState, Ar
 
 
 class PickCubeController(PickShelfController):
-    """Pick a cube up off the ground, taking no continuous parameters.
+    """Pick a cube up off the ground, standing where the caller's parameters say.
 
     The object parameters are:
         robot: The robot itself.
         cube: The cube to pick up.
 
-    Where to stand is derived rather than sampled: head-on, at a distance within the
-    arm's reach, so a caller cannot draw an unreachable pose and there is nothing for
-    a refiner to backtrack over. A grasp that closes on nothing releases before
-    terminating, leaving the hand empty rather than commanded shut on air.
+    The continuous parameters are:
+        distance: how far from the cube to stand, in metres.
+        rot: where to stand around the cube, as an offset from its own facing.
+
+    Both come straight from the shelf pick this inherits from, so the two picks in
+    this repo say "where to stand" the same way. They are sampled rather than fixed
+    because ``Holding`` is true of an edge grasp and a face grasp alike -- refinement
+    cannot see the difference until a downstream skill drops the cube, at which point
+    backtracking needs a *different* place to stand to try. A grasp that closes on
+    nothing releases before terminating, leaving the hand empty rather than commanded
+    shut on air.
     """
 
     class PickCubeControllerPhase(enum.Enum):
@@ -720,9 +730,9 @@ class PickCubeController(PickShelfController):
         GRASPING = enum.auto()
         RELEASING = enum.auto()
 
-    # Directly along the cube's own facing (no rotation offset), at a distance within
-    # the arm's reach. Not searched: the pick zone has no obstacles to route around,
-    # so a failure here is a real planning failure, not a standoff worth retrying.
+    # Head-on at 0.55 m: the midpoint of the sampled box below, and what this
+    # controller used to hardcode. Kept as the one named point in the box so a caller
+    # that wants the un-searched pick can still ask for it by name.
     STANDOFF = (0.55, 0.0)
 
     # Aim at the cube's centre, not the shelf pick's +10 mm. The cube is canonicalised
@@ -742,9 +752,11 @@ class PickCubeController(PickShelfController):
         super().__init__(*args, **kwargs)
         self._phase = self.PickCubeControllerPhase.GRASPING
 
-    def sample_parameters(self, x: ObjectCentricState, rng: np.random.Generator) -> Any:
-        # No parameters for this controller.
-        return tuple()
+    # sample_parameters is inherited: the shelf pick's uniform draw over
+    # MOVE_TO_TARGET_DISTANCE_BOUNDS x MOVE_TO_TARGET_ROT_BOUNDS, whose only rejection
+    # is standing too close to a *different* cube. Tossing3D-o1 has no second cube, so
+    # here it is a plain uniform draw over the box -- but inheriting rather than
+    # reimplementing keeps that guard for a scene that grows one.
 
     def reset(
         self,
@@ -753,7 +765,6 @@ class PickCubeController(PickShelfController):
         extend_xy_magnitude: float = 0.025,
         extend_rot_magnitude: float = np.pi / 8,
     ) -> None:
-        del params
         self._phase = self.PickCubeControllerPhase.GRASPING
         # Grasp as if upright, not from the raw rotation (which could ask for below).
         cube = self.objects[1]
@@ -772,7 +783,7 @@ class PickCubeController(PickShelfController):
             try:
                 super().reset(
                     upright,
-                    np.array(self.STANDOFF),
+                    params,
                     extend_xy_magnitude=extend_xy_magnitude,
                     extend_rot_magnitude=extend_rot_magnitude,
                 )
@@ -1198,6 +1209,17 @@ def create_lifted_controllers(
         LiftedParameterizedController(
             [robot, cube, barrier],
             PickCubeController,
+            params_space=Box(
+                low=np.array(
+                    [MOVE_TO_TARGET_DISTANCE_BOUNDS[0], MOVE_TO_TARGET_ROT_BOUNDS[0]],
+                    dtype=np.float32,
+                ),
+                high=np.array(
+                    [MOVE_TO_TARGET_DISTANCE_BOUNDS[1], MOVE_TO_TARGET_ROT_BOUNDS[1]],
+                    dtype=np.float32,
+                ),
+                dtype=np.float32,
+            ),
         )
     )
 
